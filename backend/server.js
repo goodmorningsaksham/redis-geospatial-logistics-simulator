@@ -8,7 +8,7 @@ const { connectDB, Order } = require('./config/db');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Increase limit for large path arrays
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -40,26 +40,27 @@ app.post('/api/driver-locations', async (req, res) => {
     const { drivers } = req.body;
     if (!drivers || !drivers.length) return res.sendStatus(200);
 
-    // LOG ONCE: Show us that the simulator is connected
-    // We store a simple flag so we don't spam the console
-    if (!global.hasReceivedHeartbeat) {
-        console.log(`💓 Heartbeat received from ${drivers.length} drivers.`);
-        global.hasReceivedHeartbeat = true;
-    }
-    
     const pipeline = redis.pipeline();
     drivers.forEach(d => {
         pipeline.geoadd('drivers', d.lng, d.lat, d.id);
-        // FORCE UPDATE status
         pipeline.hset('driver_statuses', d.id, d.status); 
     });
     await pipeline.exec();
     
+    // Broadcast positions to frontend
     io.emit('drivers_update', drivers);
     res.send({ status: 'OK' });
 });
 
-// --- 2. CREATE ORDER ---
+// --- 2. NEW: Receive Route Geometry from Simulator ---
+app.post('/api/driver-route', (req, res) => {
+    const { driverId, routePath, type, orderId } = req.body;
+    // Broadcast to frontend immediately
+    io.emit('route_update', { driverId, routePath, type, orderId });
+    res.send({ status: 'OK' });
+});
+
+// --- 3. CREATE ORDER ---
 app.post('/api/orders', async (req, res) => {
     const { customer_name, item, lat, lng } = req.body;
     console.log(`📥 Processing order for ${customer_name}...`);
@@ -72,37 +73,23 @@ app.post('/api/orders', async (req, res) => {
             if (dist < minDist) { minDist = dist; nearestWarehouse = w; }
         });
 
-        // Get Candidates
         const candidates = await redis.georadius('drivers', nearestWarehouse.lng, nearestWarehouse.lat, 50, 'km', 'ASC', 'COUNT', 10);
-        
         let assignedDriverId = null;
-
-        // DEBUG: Print candidates
-        console.log(`🔍 Found ${candidates.length} candidates nearby.`);
 
         for (const driverId of candidates) {
             let status = await redis.hget('driver_statuses', driverId);
-            
-            // FIX: If status is NULL (Simulator hasn't reported yet), treat as IDLE
             if (!status) status = 'IDLE';
-
-            // DEBUG LOG: See exactly what the server sees
-            // console.log(`   > Checking ${driverId}: Status is [${status}]`);
-
             if (status === 'IDLE') {
                 assignedDriverId = driverId;
-                // Lock them immediately
                 await redis.hset('driver_statuses', driverId, 'ASSIGNED');
                 break;
             }
         }
 
         if (!assignedDriverId) {
-            console.log("⚠️ All nearby drivers are busy (Status != IDLE)");
             return res.status(404).json({ message: "Drivers are busy. Please try again." });
         }
 
-        // Create Order
         const newOrder = await Order.create({
             customer_name, item, driver_id: assignedDriverId,
             delivery_lat: lat, delivery_lng: lng, status: 'ASSIGNED'
@@ -118,10 +105,9 @@ app.post('/api/orders', async (req, res) => {
         await redis.set(`mission:${assignedDriverId}`, JSON.stringify(missionData));
         
         io.emit('order_created', { 
-            id: newOrder.id, lat, lng, driverId: assignedDriverId, status: 'ASSIGNED' 
+            id: newOrder.id, lat, lng, driverId: assignedDriverId, status: 'ASSIGNED', customer_name, item 
         });
 
-        console.log(`✅ Assigned ${assignedDriverId} to Order #${newOrder.id}`);
         res.json({ success: true, order: newOrder });
 
     } catch (err) {
@@ -131,10 +117,9 @@ app.post('/api/orders', async (req, res) => {
 });
 
 app.post('/api/orders/finish', async (req, res) => {
-    const { orderId, driverId } = req.body;
+    const { orderId } = req.body;
     try {
         await Order.update({ status: 'DELIVERED' }, { where: { id: orderId } });
-        console.log(`🏁 Order ${orderId} Complete.`);
         io.emit('order_finished', { orderId });
         res.json({ success: true });
     } catch (e) { console.error(e); res.status(500).send("Error"); }
