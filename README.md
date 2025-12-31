@@ -207,9 +207,3 @@ python main.py
 
 - **Vehicle Types**  
   Scooters vs Vans with different speeds & capacities
-
----
-
-## 📄 License
-
-MIT License
